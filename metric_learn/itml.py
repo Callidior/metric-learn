@@ -18,6 +18,7 @@ import numpy as np
 from six.moves import xrange
 from sklearn.metrics import pairwise_distances
 from sklearn.utils.validation import check_array, check_X_y
+from choldate import cholupdate, choldowndate
 
 from .base_metric import BaseMetricLearner
 from .constraints import Constraints
@@ -68,9 +69,9 @@ class ITML(BaseMetricLearner):
     self.bounds_[self.bounds_==0] = 1e-9
     # init metric
     if self.A0 is None:
-      self.A_ = np.identity(X.shape[1])
+      self.L_ = np.identity(X.shape[1])
     else:
-      self.A_ = check_array(self.A0)
+      self.L_ = np.linalg.cholesky(check_array(self.A0)).T
     return a,b,c,d
 
   def fit(self, X, constraints, bounds=None):
@@ -97,28 +98,36 @@ class ITML(BaseMetricLearner):
     neg_bhat = np.zeros(num_neg) + self.bounds_[1]
     pos_vv = self.X_[a] - self.X_[b]
     neg_vv = self.X_[c] - self.X_[d]
-    A = self.A_
+    L = self.L_
 
     for it in xrange(self.max_iter):
       # update positives
       for i,v in enumerate(pos_vv):
-        wtw = v.dot(A).dot(v)  # scalar
+        Lv = L.dot(v)
+        wtw = np.sum(Lv ** 2)  # scalar
         alpha = min(_lambda[i], gamma_proj*(1./wtw - 1./pos_bhat[i]))
         _lambda[i] -= alpha
         beta = alpha/(1 - alpha*wtw)
         pos_bhat[i] = 1./((1 / pos_bhat[i]) + (alpha / gamma))
-        Av = A.dot(v)
-        A += np.outer(Av, Av * beta)
+        Av = L.T.dot(Lv)
+        if beta >= 0:
+          cholupdate(L, np.sqrt(beta) * Av)
+        else:
+          choldowndate(L, np.sqrt(-beta) * Av)
 
       # update negatives
       for i,v in enumerate(neg_vv):
-        wtw = v.dot(A).dot(v)  # scalar
+        Lv = L.dot(v)
+        wtw = np.sum(Lv ** 2)  # scalar
         alpha = min(_lambda[i+num_pos], gamma_proj*(1./neg_bhat[i] - 1./wtw))
         _lambda[i+num_pos] -= alpha
         beta = -alpha/(1 + alpha*wtw)
         neg_bhat[i] = 1./((1 / neg_bhat[i]) - (alpha / gamma))
-        Av = A.dot(v)
-        A += np.outer(Av, Av * beta)
+        Av = L.T.dot(Lv)
+        if beta >= 0:
+          cholupdate(L, np.sqrt(beta) * Av)
+        else:
+          choldowndate(L, np.sqrt(-beta) * Av)
 
       normsum = np.linalg.norm(_lambda) + np.linalg.norm(lambdaold)
       if normsum == 0:
@@ -136,8 +145,8 @@ class ITML(BaseMetricLearner):
     self.n_iter_ = it
     return self
 
-  def metric(self):
-    return self.A_
+  def transformer(self):
+    return self.L_
 
 
 class ITML_Supervised(ITML):
