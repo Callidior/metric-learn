@@ -1,8 +1,11 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
 from setuptools import setup
+from distutils.extension import Extension
+import numpy
+from Cython.Build import cythonize
 
-version = "0.4.0"
+version = "0.5.0"
 setup(name='metric-learn',
       version=version,
       description='Python implementations of metric learning algorithms',
@@ -23,13 +26,15 @@ setup(name='metric-learn',
           'numpy',
           'scipy',
           'scikit-learn',
-          'six'
+          'six',
+          'cython'
       ],
       extras_require=dict(
           docs=['sphinx', 'shinx_rtd_theme', 'numpydoc'],
           demo=['matplotlib'],
       ),
       test_suite='test',
+      ext_modules = cythonize([Extension("metric_learn.itml", ["metric_learn/itml.pyx"], include_dirs = [numpy.get_include()])]),
       keywords=[
           'Metric Learning',
           'Large Margin Nearest Neighbor',

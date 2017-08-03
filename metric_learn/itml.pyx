@@ -15,14 +15,25 @@ Adapted from Matlab code at http://www.cs.utexas.edu/users/pjain/itml/
 
 from __future__ import print_function, absolute_import
 import numpy as np
-from six.moves import xrange
 from sklearn.metrics import pairwise_distances
 from sklearn.utils.validation import check_array, check_X_y
-from choldate import cholupdate, choldowndate
 
 from .base_metric import BaseMetricLearner
 from .constraints import Constraints
 from ._util import vector_norm
+
+cimport cython
+cimport numpy as np
+from cython cimport floating
+from libc.math cimport sqrt as sqrtd
+from libc.math cimport fabs as fabsd
+
+cdef extern from "<math.h>" nogil:
+  float fabsf(float x)
+  float sqrtf(float x)
+
+ctypedef floating (*SQRT)(floating x) nogil
+ctypedef floating (*ABS)(floating x) nogil
 
 
 class ITML(BaseMetricLearner):
@@ -69,12 +80,15 @@ class ITML(BaseMetricLearner):
     self.bounds_[self.bounds_==0] = 1e-9
     # init metric
     if self.A0 is None:
-      self.L_ = np.identity(X.shape[1])
+      self.L_ = np.identity(X.shape[1], dtype=X.dtype)
     else:
-      self.L_ = np.linalg.cholesky(check_array(self.A0)).T
+      self.L_ = np.linalg.cholesky(check_array(self.A0)).astype(X.dtype).T
     return a,b,c,d
 
-  def fit(self, X, constraints, bounds=None):
+  @cython.boundscheck(False)
+  @cython.wraparound(False)
+  @cython.cdivision(True)
+  def fit(self, np.ndarray[floating, ndim=2] X, constraints, bounds=None):
     """Learn the ITML model.
 
     Parameters
@@ -87,23 +101,40 @@ class ITML(BaseMetricLearner):
     bounds : list (pos,neg) pairs, optional
         bounds on similarity, s.t. d(X[a],X[b]) < pos and d(X[c],X[d]) > neg
     """
+    cdef SQRT sqrt
+    if floating is float:
+      dtype = np.float32
+      sqrt = sqrtf
+    else:
+      dtype = np.float64
+      sqrt = sqrtd
+    
     a,b,c,d = self._process_inputs(X, constraints, bounds)
-    gamma = self.gamma
-    num_pos = len(a)
-    num_neg = len(c)
-    _lambda = np.zeros(num_pos + num_neg)
-    lambdaold = np.zeros_like(_lambda)
-    gamma_proj = 1. if gamma is np.inf else gamma/(gamma+1.)
-    pos_bhat = np.zeros(num_pos) + self.bounds_[0]
-    neg_bhat = np.zeros(num_neg) + self.bounds_[1]
-    pos_vv = self.X_[a] - self.X_[b]
-    neg_vv = self.X_[c] - self.X_[d]
-    L = self.L_
+    cdef floating gamma = <floating>self.gamma
+    cdef int num_pos = len(a)
+    cdef int num_neg = len(c)
+    cdef np.ndarray[floating, ndim=1] _lambda = np.zeros(num_pos + num_neg, dtype=dtype)
+    cdef np.ndarray[floating, ndim=1] lambdaold = np.zeros_like(_lambda)
+    cdef floating gamma_proj = 1. if self.gamma is np.inf else gamma/(gamma+1.)
+    cdef np.ndarray[floating, ndim=1] pos_bhat = np.zeros(num_pos, dtype=dtype) + self.bounds_[0]
+    cdef np.ndarray[floating, ndim=1] neg_bhat = np.zeros(num_neg, dtype=dtype) + self.bounds_[1]
+    cdef np.ndarray[floating, ndim=2] pos_vv = self.X_[a] - self.X_[b]
+    cdef np.ndarray[floating, ndim=2] neg_vv = self.X_[c] - self.X_[d]
+    cdef np.ndarray[floating, ndim=2] L = self.L_
 
-    for it in xrange(self.max_iter):
+    cdef np.ndarray[floating, ndim=1] Lv
+    cdef np.ndarray[floating, ndim=1] Av
+    cdef floating wtw
+    cdef floating alpha
+    cdef floating beta
+
+    cdef int i
+    cdef int it
+    cdef int max_iter = self.max_iter
+    for it in range(max_iter):
       # update positives
-      for i,v in enumerate(pos_vv):
-        Lv = L.dot(v)
+      for i in range(num_pos):
+        Lv = L.dot(pos_vv[i])
         wtw = np.sum(Lv ** 2)  # scalar
         alpha = min(_lambda[i], gamma_proj*(1./wtw - 1./pos_bhat[i]))
         _lambda[i] -= alpha
@@ -111,13 +142,13 @@ class ITML(BaseMetricLearner):
         pos_bhat[i] = 1./((1 / pos_bhat[i]) + (alpha / gamma))
         Av = L.T.dot(Lv)
         if beta >= 0:
-          cholupdate(L, np.sqrt(beta) * Av)
+          cholupdate(L, Av, sqrt(beta))
         else:
-          choldowndate(L, np.sqrt(-beta) * Av)
+          choldowndate(L, Av, sqrt(-beta))
 
       # update negatives
-      for i,v in enumerate(neg_vv):
-        Lv = L.dot(v)
+      for i in range(num_neg):
+        Lv = L.dot(neg_vv[i])
         wtw = np.sum(Lv ** 2)  # scalar
         alpha = min(_lambda[i+num_pos], gamma_proj*(1./neg_bhat[i] - 1./wtw))
         _lambda[i+num_pos] -= alpha
@@ -125,9 +156,9 @@ class ITML(BaseMetricLearner):
         neg_bhat[i] = 1./((1 / neg_bhat[i]) - (alpha / gamma))
         Av = L.T.dot(Lv)
         if beta >= 0:
-          cholupdate(L, np.sqrt(beta) * Av)
+          cholupdate(L, Av, sqrt(beta))
         else:
-          choldowndate(L, np.sqrt(-beta) * Av)
+          choldowndate(L, Av, sqrt(-beta))
 
       normsum = np.linalg.norm(_lambda) + np.linalg.norm(lambdaold)
       if normsum == 0:
@@ -205,3 +236,93 @@ class ITML_Supervised(ITML):
     pos_neg = c.positive_negative_pairs(num_constraints,
                                         random_state=random_state)
     return ITML.fit(self, X, pos_neg, bounds=self.bounds)
+
+
+
+# Rank-1 Cholesky update implementation from https://github.com/jcrudy/choldate
+
+@cython.cdivision(True)
+cdef inline floating hypot(floating x,floating y):
+  cdef floating t
+  x = fabsf(x) if floating is float else fabsd(x)
+  y = fabsf(y) if floating is float else fabsd(y)
+  t = x if x < y else y
+  x = x if x > y else y
+  t = t/x
+  return x*sqrtf(1+t*t) if floating is float else x*sqrtd(1+t*t)
+
+@cython.cdivision(True)
+cdef inline floating rypot(floating x,floating y):
+  cdef floating t
+  x = fabsf(x) if floating is float else fabsd(x)
+  y = fabsf(y) if floating is float else fabsd(y)
+  t = x if x < y else y
+  x = x if x > y else y
+  t = t/x
+  return x*sqrtf(1-t*t) if floating is float else x*sqrtd(1-t*t)
+
+@cython.boundscheck(False)
+@cython.wraparound(False)
+@cython.cdivision(True)
+cdef cholupdate(np.ndarray[floating, ndim=2] R, np.ndarray[floating, ndim=1] x, floating scale):
+  '''
+  Update the upper triangular Cholesky factor R with the rank 1 addition
+  implied by x such that:
+  R_'R_ = R'R + outer(x,x)
+  where R_ is the upper triangular Cholesky factor R after updating.  Note
+  that both x and R are modified in place.
+  '''
+  cdef unsigned int p
+  cdef unsigned int k
+  cdef unsigned int i
+  cdef floating r
+  cdef floating c
+  cdef floating s
+
+  p = x.shape[0]
+  
+  if scale != 1:
+    for k in range(p):
+      x[k] *= scale
+  
+  for k in range(p):
+    r = hypot(R[<unsigned int>k,<unsigned int>k], x[<unsigned int>k])
+    c = r / R[<unsigned int>k,<unsigned int>k]
+    s = x[<unsigned int>k] / R[<unsigned int>k,<unsigned int>k]
+    R[<unsigned int>k,<unsigned int>k] = r
+    for i in range(<unsigned int>(k+1),<unsigned int>p):
+      R[<unsigned int>k,<unsigned int>i] = (R[<unsigned int>k,<unsigned int>i] + s*x[<unsigned int>i]) / c
+      x[<unsigned int>i] = c * x[<unsigned int>i] - s * R[<unsigned int>k,<unsigned int>i]
+
+@cython.boundscheck(False)
+@cython.wraparound(False)
+@cython.cdivision(True)
+cdef choldowndate(np.ndarray[floating, ndim=2] R, np.ndarray[floating, ndim=1] x, floating scale):
+  '''
+  Update the upper triangular Cholesky factor R with the rank 1 subtraction
+  implied by x such that:
+  R_'R_ = R'R - outer(x,x)
+  where R_ is the upper triangular Cholesky factor R after updating.  Note
+  that both x and R are modified in place.
+  '''
+  cdef unsigned int p
+  cdef unsigned int k
+  cdef unsigned int i
+  cdef floating r
+  cdef floating c
+  cdef floating s
+
+  p = x.shape[0]
+  
+  if scale != 1:
+    for k in range(p):
+      x[k] *= scale
+  
+  for k in range(p):
+    r = rypot(R[<unsigned int>k,<unsigned int>k], x[<unsigned int>k])
+    c = r / R[<unsigned int>k,<unsigned int>k]
+    s = x[<unsigned int>k] / R[<unsigned int>k,<unsigned int>k]
+    R[<unsigned int>k,<unsigned int>k] = r
+    for i in range(<unsigned int>(k+1),<unsigned int>p):
+      R[<unsigned int>k,<unsigned int>i] = (R[<unsigned int>k,<unsigned int>i] - s*x[<unsigned int>i]) / c
+      x[<unsigned int>i] = c * x[<unsigned int>i] - s * R[<unsigned int>k,<unsigned int>i]

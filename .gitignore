@@ -5,3 +5,5 @@ dist/
 .coverage
 htmlcov/
 .cache/
+metric_learn/*.c
+metric_learn/*.so
